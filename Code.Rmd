@@ -1,0 +1,578 @@
+---
+title: "NBA Predictive Analytics"
+author: "Bill Xiao"
+date: "6/10/2023"
+output:
+  pdf_document:
+  keep_tex: true
+  pandoc_args: ["--quiet"]
+  
+---
+
+## 0. Before your start
+This file includes some R codes that are used in the project "Win-Loss Prediction in NBA Games".
+The code is for eductional purpose only. It is provided 'as is' without warranty of any kind, either express or implied, warranties of fitness for a purpose, or the warranty of non-infringement. 
+Although the authors try their best to test the tool, they make no warranty that
+(1) it will meet your requirements;
+(2) it will be secure or error-free;
+(3) the results that may be obtained from the use of the code will be effective, accurate or reliable;
+(4) any errors in the tool will be corrected.
+
+The author assume no responsibility for errors or omissions in the code or related documentation. In no event shall the sponsor and the authors be liable to youor any third parties for any damages of any kind arising out of or in connection with the use of the code. 
+
+R is a open-source statistical software and can be downloaded at www.r-project.org
+The codes have been tested using R4.2.3
+
+Install packages: 
+```{r}
+library(ada)
+library(adabag)
+library(car)
+library(caret)
+library(class)
+library(corrplot)
+library(dplyr)
+library(e1071)
+library(ggplot2)
+library(glmnet)
+library(hoopR)
+library(knitr)
+library(MASS)
+library(partykit)
+library(pROC)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library("SmartEDA")
+library(tictoc)
+library(xfun)
+library(zoo)
+
+```
+
+
+## 1. Extract Data
+NBA team box scores (2019-2022) 
+```{r}
+
+#change this to your local directory where you stored the data file. All result files will be populated to this directory as well
+
+setwd("C:/Users/17329/Desktop/6609_Projects/Codes")
+
+for (i in 2019:2022){
+ ds <- load_nba_team_box(i)
+ write.csv(ds, paste0(i,"team_data.csv"),
+           row.names = FALSE)}
+
+```
+
+## 2. Combine Data
+```{r}
+raw <- read.csv("2019team_data.csv")
+for (i in 2020:2022){
+  y <- paste0(i,"team_data.csv")
+  data <- read.csv(y)
+  raw <- bind_rows(raw,data)
+  }
+```
+
+## 3. Add Variables
+Two points field made. 
+```{r}
+raw$two_point_field_goals_made<-(raw$field_goals_made-raw$three_point_field_goals_made)
+raw$two_point_field_goals_attempted<-(raw$field_goals_attempted-raw$three_point_field_goals_attempted)
+raw$two_point_field_goal_pct <-
+  round(100*raw$two_point_field_goals_made/raw$two_point_field_goals_attempted,1)
+
+```
+
+## 4. Variables of interest
+```{r}
+columns<-c("season","season_type","game_date","team_name","team_home_away",
+           "team_score","team_winner","assists","blocks","steals",
+           "defensive_rebounds","offensive_rebounds",
+           "points_in_paint","fast_break_points",
+           "total_turnovers","turnover_points",
+           "free_throw_pct","free_throws_made","free_throws_attempted",
+           "field_goal_pct","field_goals_made","field_goals_attempted",
+           "two_point_field_goal_pct","two_point_field_goals_made",
+           "two_point_field_goals_attempted",
+           "three_point_field_goal_pct","three_point_field_goals_made",
+           "three_point_field_goals_attempted",
+           "flagrant_fouls","fouls","technical_fouls")
+
+raw1 <- raw[,columns]
+# (all(columns %in% colnames(raw)))
+
+# Add a new column to identify each game
+raw1$game_id <- rep(1:(nrow(raw1)/2), each = 2)
+
+# Split the data frame into two: one for Team A and one for Team B
+team_a <- raw1[seq(1, nrow(raw1), by = 2), ]
+team_b <- raw1[seq(2, nrow(raw1), by = 2), ]
+
+# Rename the columns in the Team B data frame to indicate that they are for the opponent
+names(team_b) <- paste0("opponent_", names(team_b))
+team_b <- rename(team_b, game_id=opponent_game_id)
+# Merge the two data frames back together by game_id
+merged <- left_join(team_a, team_b, by = "game_id")
+nba <- merged[,c(c(1:17),20,23,26,30,36,38,c(40:49),52,55,58,62)]
+nba$score_difference<-nba$team_score-nba$opponent_team_score
+# write.csv(nba, "nba.csv")
+nba$team_winner <- 1*(nba$team_winner==TRUE)
+nba$team_home_away <- 1*(nba$team_home_away=="home")
+nba$game_date <- as.Date(nba$game_date, format = "%m/%d/%Y")
+
+# recoding variables
+nba$Season <- nba$season
+nba$Type <- nba$season_type
+nba$Date <- nba$game_date
+nba$Team <- nba$team_name
+nba$Opponent <- nba$opponent_team_name
+nba$HA <- nba$team_home_away
+nba$WL <- nba$team_winner
+nba$DIFF <- nba$team_score-nba$opponent_team_score
+nba$AST <- nba$assists-nba$opponent_assists
+nba$BLK <- nba$blocks-nba$opponent_blocks
+nba$STL <- nba$steals-nba$opponent_steals
+nba$DRB <- nba$defensive_rebounds-nba$opponent_defensive_rebounds
+nba$ORB <- nba$offensive_rebounds-nba$opponent_offensive_rebounds
+nba$PIP <- nba$points_in_paint-nba$opponent_points_in_paint
+nba$FBP <- nba$fast_break_points-nba$opponent_fast_break_points
+nba$TOV <- nba$total_turnovers-nba$opponent_total_turnovers
+nba$TOVP <- nba$turnover_points-nba$opponent_turnover_points
+nba$FTp <- nba$free_throw_pct-nba$opponent_free_throw_pct
+nba$FGp <- nba$field_goal_pct-nba$opponent_field_goal_pct
+nba$P2p <- nba$two_point_field_goal_pct-nba$opponent_two_point_field_goal_pct
+nba$P3p <- nba$three_point_field_goal_pct-nba$opponent_three_point_field_goal_pct
+nba$FOUL <- nba$fouls-nba$opponent_fouls
+
+data <- nba[, c("Season", "Type", "Date", "Team", "Opponent", 
+                "WL", "DIFF", "AST", "BLK", "STL", "DRB", 
+                "ORB", "PIP", "FBP", "FOUL", "TOV", "TOVP", 
+                "FTp", "FGp", "P2p", "P3p")]
+
+```
+
+## 5. Remove outlier
+```{r}
+data$Date <- as.Date(data$Date, format = "%m/%d/%Y")
+data <- data[order(data$Date),]
+data <- filter(data, !(Team %in% c("World", "Team LeBron", "Team Durant")))
+data <- filter(data, !(Team %in% c("USA", "Team Giannis", 
+                                   "Team Durant","Team LeBron")))
+
+```
+
+## 6. EDA
+```{r}
+# focus on non-standardized "nba" data set
+eda<-nba[,39:60]
+# Variables to use in later models
+ExpData(eda,type=2)
+# distribution of categorical variable
+ExpCatViz(eda)
+# distribution of numeric variable
+ExpNumStat(eda[,8:22],Outlier = TRUE)
+
+# Calculate the correlation matrix for numerical variables
+
+correlation_matrix<-cor(eda[,8:22])
+# Plot the correlation heatmap
+# round(correlation_matrix,3)
+# all correlations between predictors are below 0.8, which suggests that there is no strong linear relationship or multicollinearity among the predictors.
+```
+
+## 7. 3-game simple moving average
+```{r}
+# Scale numerical variables
+numerical_vars <- c("DIFF", "AST", "BLK", "STL", "DRB", "ORB", 
+                    "PIP", "FBP", "FOUL","TOV", "TOVP", "FTp", 
+                    "FGp", "P2p", "P3p")  
+data[numerical_vars] <- lapply(data[numerical_vars], scale)
+# Specify categorical variables
+categorical_vars <- c("Type", "Team", "Opponent", "WL")  
+data[categorical_vars] <- lapply(data[categorical_vars], as.factor)
+
+# Specify the variables for which to calculate the moving average
+variables <- c("DIFF", "AST", "BLK", "STL", "DRB", "ORB", 
+               "PIP", "FBP", "FOUL","TOV", "TOVP", "FTp", 
+               "FGp", "P2p", "P3p")
+
+# Calculate the three-game moving average with a lag of 1 for each team and each variable
+data1 <- data %>%
+  arrange(Team, Date) %>%
+  group_by(Team) %>%
+  mutate(across(all_of(variables), 
+                ~ lag(rollmean(., 3, fill = NA, align = "right"), 1)))
+
+# sum(is.na(data1)) # 0
+data1 <- na.omit(data1)
+
+train = data1[data1$Season!=2022, ]
+test  = data1[data1$Season==2022, ]
+
+# sum(data1$Season==2022) # 1317
+# sum(data1$Season!=2022) # 3524
+
+# evaluation metrics
+metrics = function(CM){
+  # CM = confusionMatrix
+  TN=CM$table[1,1]
+  FN=CM$table[1,2]
+  FP=CM$table[2,1]
+  TP=CM$table[2,2]
+  recall=TP/(TP+FN)
+  precision = TP/(TP+FP)
+  accuracy=(TP+TN)/(sum(CM$table))
+  F1 = 2*recall*precision/(recall+precision)
+  result = data.frame(
+    Metrics = c("Accuracy","F measure"),
+    Values = c(accuracy, F1)
+  )
+  return(result)
+}
+
+# CM = confusionMatrix(as.factor(test$LR_WL), test$WL)
+
+# CM = confusionMatrix(test$RFpredicted_WL, test$WL)
+
+# metrics(CM)
+
+```
+
+## 8. Naive bayes
+```{r}
+# Specify the predictors
+predictors <- c("Team", "Opponent", "DIFF", "AST", "BLK",
+                "STL", "DRB", "ORB", "PIP", "FBP", "FOUL",
+                "TOV", "TOVP", "FTp", "FGp", "P2p", "P3p")
+
+# Fit a Naive Bayes model
+NBmodel <- naiveBayes(WL ~ ., data = train[, c("WL", predictors)])
+
+# print(NBmodel)
+
+# Predict on the training set
+train$predicted_WL <- predict(NBmodel, newdata = train[, predictors])
+
+# Print the confusion matrix for the training set
+# print(confusionMatrix(train$predicted_WL, train$WL))
+
+# Predict on the test set
+test$NBpredicted_WL <- predict(NBmodel, newdata = test[, predictors])
+
+# Print the confusion matrix for the test set
+
+# print(confusionMatrix(test$NBpredicted_WL, test$WL))
+
+```
+
+## 9. KNN
+```{r}
+# Find the optimal value of K using cross-validation
+set.seed(1)
+trainControl <- trainControl(method = "cv", number = 5) # 5-fold
+
+KNNpredictors <- c("DIFF", "AST", "BLK", "STL", "DRB", "ORB", "PIP", "FBP", "FOUL","TOV", "TOVP", "FTp", "FGp", "P2p", "P3p")
+# only include numeric variables in KNN setting
+
+knnFit <- train(WL ~ ., data = train, 
+                method = "knn", 
+                tuneLength = 25, trControl = trainControl)
+print(knnFit)
+
+train_KNN_accuracy = 0.5528
+
+# Create the plot
+ggplot(data = knnFit$results, aes(x = k, y = Accuracy)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Number of Neighbors (k)", y = "Cross-Validated Accuracy") +
+  ggtitle("K-Nearest Neighbors Model Tuning") +
+  theme_minimal()
+
+# Predict on the test set using the optimal value of K
+test$KNNpredicted_WL <- knn(train = train[, KNNpredictors], 
+                             test = test[, KNNpredictors], 
+                             cl = train$WL, k = knnFit$bestTune$k)
+
+# Print the confusion matrix for the test set
+print(confusionMatrix(test$KNNpredicted_WL, test$WL))
+test_KNN_accuracy = 0.5254
+
+```
+
+## 10. Logistic regression 
+```{r}
+# Specify the predictors
+LRpredictors <- c("Team", "Opponent", "DIFF", "AST", "BLK", "STL", "DRB", "ORB", "PIP", "FBP", "FOUL","TOV", "TOVP", "FTp", "FGp", "P2p", "P3p")
+
+# Fit a logistic regression model
+full_model <- glm(WL ~ ., train[, c("WL", LRpredictors)], 
+                  family = binomial(link = "logit"))
+
+print(summary(full_model))
+
+# Perform backward selection
+bw_model <- stepAIC(full_model, direction = "backward")
+
+# Print the selected model
+print(bw_model)
+
+# Predict on the training set
+train$LRpredicted_WL <- predict(bw_model, newdata = train[, LRpredictors], 
+                                type = "response")
+
+# Find the optimal probability threshold for the training set
+roc_obj <- roc(train$WL, train$LRpredicted_WL)
+coords_obj <- coords(roc_obj, "best")
+optimal_threshold <- coords_obj["threshold"]
+# print(optimal_threshold)
+
+# Convert ROC object to a data frame for ggplot
+roc_df <- data.frame(
+  TPR = roc_obj$sensitivities,
+  FPR = 1 - roc_obj$specificities,
+  Thresholds = roc_obj$thresholds
+)
+
+# Create the ROC curve plot
+ggplot(data = roc_df, aes(x = FPR, y = TPR)) +
+  geom_line() +
+  geom_point(data = roc_df[roc_df$Thresholds == optimal_threshold, ], color = "red") +
+  labs(
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    title = "ROC Curve with Optimal Threshold"
+  ) +
+  theme_minimal() +
+  annotate("text", x = .75, y = .45, 
+           label = paste("Optimal Threshold: ",
+                         round(optimal_threshold, 4)), 
+           color = "red")
+
+# Convert probabilities to class labels based on the optimal threshold
+train$LR_WL <- ifelse(train$LRpredicted_WL > as.numeric(optimal_threshold), 1, 0)
+
+# Print the confusion matrix for the training set
+# print(confusionMatrix(as.factor(train$LR_WL), train$WL))
+
+# Predict on the test set
+test$LRpredicted_WL <- predict(bw_model, newdata = test[, LRpredictors], 
+                             type = "response")
+
+test$LR_WL <- ifelse(test$LRpredicted_WL > as.numeric(optimal_threshold), 1, 0)
+
+# Print the confusion matrix for the test set
+# print(confusionMatrix(as.factor(test$LR_WL), test$WL))
+
+vif(bw_model)
+
+```
+
+## 11. Decision tree
+```{r}
+# Specify the predictors
+DTpredictors <- c("Team", "Opponent", "DIFF", "AST", 
+                  "BLK", "STL", "DRB", "ORB", "PIP", "FBP",
+                  "FOUL","TOV", "TOVP", "FTp", "FGp", "P2p", "P3p")
+
+# Fit a decision tree model
+tree_model <- rpart(WL ~ ., data = train[, c("WL", LRpredictors)],
+                    method = "class", 
+                    control = rpart.control(cp = 0.01))
+
+# Perform 5-fold cross-validation to determine the optimal tree size
+set.seed(100)
+cv_DTmodel <- train(WL ~ ., data = train[, c("WL", LRpredictors)],
+                  method = "rpart", 
+                  trControl = trainControl(method = "cv", number = 5))
+
+# Print the cross-validation results
+# print(cv_DTmodel)
+
+# Get the optimal tree size (complexity parameter)
+optimal_cp <- cv_DTmodel$bestTune$cp
+print(paste("Optimal tree size (cp):", optimal_cp))
+
+# Fit the final decision tree model with the optimal tree size
+final_DT_model <- rpart(WL ~ ., data = train[, c("WL", LRpredictors)],
+                        method = "class", 
+                        control = rpart.control(cp = optimal_cp))
+
+# Predict on the training set
+train$DTpredicted_WL <- predict(final_DT_model, 
+                                newdata = train[, c("WL", LRpredictors)], 
+                                type = "class")
+
+# Print the confusion matrix for the training set
+# confusionMatrix(train$DTpredicted_WL, train$WL)
+
+# Predict on the test set
+test$DTpredicted_WL <- predict(final_DT_model, newdata = test, type = "class")
+
+# Print the confusion matrix for the test set
+# print(confusionMatrix(test$DTpredicted_WL, test$WL))
+
+# png(filename = "tree.png", width = 1200, height = 500)
+# rpart.plot(final_DT_model, yesno=2, type=4, extra=2)
+# dev.off()
+
+```
+
+## 12. Random forest
+```{r}
+# Specify the predictors
+RFpredictors <- c("Team", "Opponent", "DIFF", "AST", "BLK", 
+                  "STL", "DRB", "ORB", "PIP", "FBP", "FOUL",
+                  "TOV", "TOVP", "FTp", "FGp", "P2p", "P3p")
+
+set.seed(100)
+# Get the optimal mtry (the one that gives the lowest error rate)
+tuning_results <- tuneRF(train[, RFpredictors], train$WL, 
+                         ntreeTry=500, stepFactor=1.5, 
+                         improve=0.01, trace=TRUE, plot=TRUE)
+
+optimal_mtry <- tuning_results[as.numeric(which.min(tuning_results[, 2])),1]
+
+# Print the optimal mtry
+# print(paste("Optimal mtry:", optimal_mtry))
+
+# Convert the tuning results to a data frame
+tuning_results_df <- as.data.frame(tuning_results)
+
+# Create a ggplot
+ggplot(tuning_results_df, aes(x = mtry, y = tuning_results[, 2])) +
+  geom_line() +
+  geom_point() +
+  geom_point(aes(x = optimal_mtry, y = min(tuning_results[, 2])), colour = 'red') +
+  labs(x = "mtry", y = "Out-of-bag error rate", title = "Tuning mtry in Random Forest") +
+  theme_minimal()
+
+# Fit the final random forest model with the optimal mtry
+final_rf_model <- randomForest(WL ~ ., train[, c("WL", LRpredictors)], 
+                               mtry = optimal_mtry, 
+                               ntree = 1000, maxnodes = 50, 
+                               nodesize = 3, importance = TRUE)
+                               
+# Predict on the training set
+train$RFpredicted_WL <- predict(final_rf_model, 
+                                newdata = train[, LRpredictors])
+
+# Print the confusion matrix for the training set
+# print(confusionMatrix(train$RFpredicted_WL, train$WL))
+
+# Predict on the test set
+test$RFpredicted_WL <- predict(final_rf_model, newdata = test)
+
+# Print the confusion matrix for the test set
+# print(confusionMatrix(test$RFpredicted_WL, test$WL))
+
+# Print the variable importance
+importance_scores <- final_rf_model$importance
+
+# Convert the importance scores to a data frame for plotting
+importance_df <- data.frame(Variable = rownames(importance_scores),
+                            Importance = importance_scores[, "MeanDecreaseAccuracy"])
+
+# Sort the variables by importance
+importance_df <- importance_df %>%
+  arrange(desc(Importance))
+
+# Plot variable importance
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Variable", 
+       y = "Importance",
+       title = "Variable Importance Plot",
+       subtitle = "Based on Mean Decrease in Accuracy") +
+  theme_minimal()
+
+```
+
+## Results
+```{r}
+candidate = c("NB","KNN","LR","DT","RF")
+
+pred = data.frame(test$NBpredicted_WL,test$KNNpredicted_WL,
+         as.factor(test$LR_WL),test$DTpredicted_WL,
+         test$RFpredicted_WL)
+
+for (i in 1:length(candidate)){
+  CM = confusionMatrix(pred[,i], test$WL)
+  print(paste(candidate[i], "Accuracy=",metrics(CM)[1,2]))
+  print(paste(candidate[i], "F1 =",metrics(CM)[2,2]))
+}
+
+# Create a data frame with the model performance measures
+performance_measures <- data.frame(
+  Model = c("Naïve Bayes", "K-nearest Neighbors", "Logistic Regression", "Decision Tree", "Random Forest"),
+  Training_Accuracy = c("59.68%", "55.28%", "62.32%", "62.09%", "72.47%"),
+  Test_F1_score = c("50.44%", "39.26%", "55.52%", "32.62%", "39.84%"),
+  Test_Accuracy = c("56.87% (0.54, 0.60)", "52.54% (0.50, 0.55)", "55.35% (0.53, 0.58)", "52.32% (0.50, 0.55)", "53.23% (0.50, 0.56)")
+)
+
+# Use kable to create the table
+kable(performance_measures, align = c('l', 'c', 'c', 'c'))
+
+
+# Extract coefficients
+coefficients <- coef(bw_model)
+
+# Print the coefficients
+print(coefficients)
+
+```
+
+## NBA ranking
+```{r}
+# Define the data
+# data extracted from https://www.basketball-reference.com/leagues/
+rk <- read.csv("ranking.csv")
+
+nba_rankings <- data.frame(
+  Team = rk$Team,
+  Season = c(rep('2018-2019', 30), 
+             rep('2019-2020', 30), 
+             rep('2020-2021', 30),
+             rep('2021-2022', 30)),  
+  MOV = c(rk$MOV2019,
+          rk$MOV2020,
+          rk$MOV2021,
+          rk$MOV2022)  
+  # Fill in the rest of the MOVs
+)
+
+# Create the plot
+ggplot(nba_rankings, aes(x = reorder(Team, -MOV), y = MOV, fill = Season)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(x = "Team", y = "Average Margin of Victory (MOV)", 
+       title = "NBA Team Rankings (2018-2022)", fill = "Season") +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
